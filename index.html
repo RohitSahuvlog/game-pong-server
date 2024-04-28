@@ -83,20 +83,80 @@
             return urlParams.get('uuid'); // Extract 'uuid' parameter
         }
 
+        function str2ab(base64) {
+            try {
+                console.log('Attempting to convert base64 to ArrayBuffer:', base64);  // Debug: Log the base64 string
+                const binaryString = window.atob(base64);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                return bytes.buffer;
+            } catch (error) {
+                console.error('Error converting base64 string to ArrayBuffer:', error);
+                throw new Error('The string to be decoded is not correctly encoded.');
+            }
+        }
+
+        async function fetchPublicKey() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/public-key`);
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch public key: ${response.statusText}`);
+                }
+                const data = await response.json();
+
+                console.log("data", data, typeof (data));
+                const pem = data.publicKey.trim();
+                const pemHeader = "-----BEGIN PUBLIC KEY-----";
+                const pemFooter = "-----END PUBLIC KEY-----";
+                const start = pem.indexOf(pemHeader) + pemHeader.length;
+                const end = pem.indexOf(pemFooter);
+                const pemContents = pem.substring(start, end).replace(/\s+/g, '');  // Remove all whitespace
+                console.log('Clean Base64:', pemContents);  // Debug: Log the clean base64 string
+                return window.crypto.subtle.importKey(
+                    "spki",
+                    str2ab(pemContents),
+                    {
+                        name: "RSA-OAEP",
+                        hash: { name: "SHA-256" }
+                    },
+                    true,
+                    ["encrypt"]
+                );
+            } catch (error) {
+                console.error('Error fetching or importing public key:', error);
+                throw error; // Re-throw the error to be handled by caller
+            }
+        }
+
+        // Encrypt the score with the public key
+        // async function encryptData(data, publicKey) {
+        //     let enc = new TextEncoder();
+        //     let encoded = enc.encode(data.toString());
+        //     let encryptedData = await window.crypto.subtle.encrypt(
+        //         { name: "RSA-OAEP" },
+        //         publicKey,
+        //         encoded
+        //     );
+        //     return new Uint8Array(encryptedData);
+        // }
+
+
+
+
+        // Start the game session
         async function startSession() {
-            uuid = getUuidFromUrl(); // Get uuid when starting the session
+            uuid = getUuidFromUrl();
             if (!uuid) {
                 console.error('UUID is required but not provided in the URL.');
                 return;
             }
-
             try {
                 const response = await fetch(`${API_BASE_URL}/start-session`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ uuid }) // Send UUID to the server
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uuid })
                 });
                 const data = await response.json();
                 if (response.ok) {
@@ -110,11 +170,39 @@
             }
         }
 
+        async function encryptData(data, secretKey) {
+            const enc = new TextEncoder();
+            const key = await crypto.subtle.importKey(
+                "raw",
+                enc.encode(secretKey), // Convert the passphrase to Uint8Array
+                { name: "AES-CBC" },
+                false,
+                ["encrypt"]
+            );
+
+            const iv = crypto.getRandomValues(new Uint8Array(16)); // Generate a random IV
+            const encryptedData = await crypto.subtle.encrypt(
+                { name: "AES-CBC", iv },
+                key,
+                enc.encode(data.toString()) // Convert data to Uint8Array
+            );
+
+            return {
+                encryptedData: Array.from(new Uint8Array(encryptedData)), // Convert buffer to byte array
+                iv: Array.from(iv) // Convert buffer to byte array
+            };
+        }
+
+
         async function submitScore(score) {
             if (!uuid || !nonce) {
                 console.error('UUID or nonce is missing, cannot submit score.');
                 return;
             }
+
+            // Encrypt the score here
+            const secretKey = '12345678901234567890123456781290'; // This should be the same key used on the server for decryption
+            const { encryptedData, iv } = await encryptData(score, secretKey);
 
             try {
                 const response = await fetch(`${API_BASE_URL}/submit-score`, {
@@ -124,7 +212,8 @@
                     },
                     body: JSON.stringify({
                         uuid, // Use the same UUID
-                        score: score,
+                        score: encryptedData, // Send the encrypted data
+                        iv: iv, // Send the IV for decryption
                         nonce: nonce
                     })
                 });

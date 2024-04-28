@@ -4,6 +4,7 @@ const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const cors = require('cors');
 
@@ -42,6 +43,8 @@ const submitScoreLimiter = rateLimit({
     max: 100
 });
 
+const publicKey = fs.readFileSync('public_key.pem', 'utf8');
+
 // Middleware to validate token
 const tokenValidationMiddleware = async (req, res, next) => {
     const { token } = req.body;
@@ -59,6 +62,26 @@ async function isValidToken(token) {
     } catch (error) {
         return false;
     }
+}
+
+const encryptionKey = '12345678901234567890123456789012'; // Must be 256 bits (32 characters)
+const iv = crypto.randomBytes(16); // Generate a random IV
+
+function encrypt(text) {
+    let cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(encryptionKey), iv);
+    let encrypted = cipher.update(text);
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+    return iv.toString('hex') + ':' + encrypted.toString('hex');
+}
+
+function decrypt(text) {
+    let textParts = text.split(':');
+    let iv = Buffer.from(textParts.shift(), 'hex');
+    let encryptedText = Buffer.from(textParts.join(':'), 'hex');
+    let decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(encryptionKey), iv);
+    let decrypted = decipher.update(encryptedText);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return decrypted.toString();
 }
 
 // Function to generate a new nonce
@@ -85,6 +108,16 @@ async function saveNonce(nonceValue) {
     await nonce.save();
 }
 
+function decryptScore(encryptedText, ivHex) {
+    const iv = Buffer.from(ivHex, 'hex');
+    let encryptedTextBuffer = Buffer.from(encryptedText, 'hex');
+    let decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from("12345678901234567890123456781290"), iv);
+    let decrypted = decipher.update(encryptedTextBuffer);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return decrypted.toString();
+}
+
+
 // Function to save score to database
 async function saveScoreToDatabase(uuid, scoreValue, nonceValue) {
     const score = new Score({
@@ -94,32 +127,40 @@ async function saveScoreToDatabase(uuid, scoreValue, nonceValue) {
     });
     await score.save();
 }
+
+app.get('/api/public-key', (req, res) => {
+    res.json({ publicKey });
+});
 // Route for submitting scores
 app.post('/submit-score',
     submitScoreLimiter,
-    // tokenValidationMiddleware,
-    body('score').isInt({ min: 0, max: 1000 }),
     async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
             return res.status(400).json({ errors: errors.array() });
         }
-        const { uuid, score, nonce } = req.body;
+        const { uuid, score, nonce, iv } = req.body;
+
         if (!uuid) {
             return res.status(400).json({ error: 'UUID is required' });
         }
 
+        // Decrypt the score
+        const encryptedScore = decryptScore(score, iv);
+        const encryptNonce = decrypt(nonce)
+
+
         // Check the nonce
-        if (!await checkNonce(nonce)) {
+        if (!await checkNonce(encryptNonce)) {
             return res.status(400).json({ error: 'Invalid nonce' });
         }
 
-        // Save the score
-        await saveScoreToDatabase(uuid, score, nonce);
+        await saveScoreToDatabase(uuid, parseInt(encryptedScore), encryptNonce);
 
         res.json({ message: 'Score submitted successfully' });
     }
 );
+
 
 
 async function checkActiveSession(req, res, next) {
@@ -132,7 +173,6 @@ async function checkActiveSession(req, res, next) {
     try {
         // Check if there's an existing, unused nonce for this UUID
         const existingNonce = await Nonce.findOne({ uuid });
-        console.log(existingNonce)
         if (existingNonce) {
             return res.status(409).json({ error: 'Active session already exists for this UUID' });
         }
@@ -145,17 +185,14 @@ async function checkActiveSession(req, res, next) {
 
 app.post('/start-session', checkActiveSession, async (req, res) => {
     const { uuid } = req.body;
-    if (!uuid) {
-        return res.status(400).json({ error: 'UUID is required' });
-    }
-
-
 
     const nonceValue = generateNonce();
+    const encryptedNonce = encrypt(nonceValue);
+
     const nonce = new Nonce({ nonce: nonceValue, uuid: uuid });
     await nonce.save();
 
-    res.json({ nonce: nonceValue });
+    res.json({ nonce: encryptedNonce });
 });
 
 // Start the server
